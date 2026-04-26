@@ -1,0 +1,13 @@
+accelerate
+diffusers
+imageio
+ipykernel
+jupyter
+matplotlib
+Pillow
+safetensors
+scikit-image
+torch
+torchvision
+tqdm
+transformers
