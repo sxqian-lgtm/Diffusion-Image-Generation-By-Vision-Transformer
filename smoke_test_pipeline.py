@@ -2,6 +2,7 @@ import argparse
 import json
 import pathlib
 from collections import Counter
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -102,10 +103,29 @@ def train_classifier_smoke(train_set, val_set, device, epochs, batch_size):
     return classifier
 
 
-def run_diffusion_smoke(classifier, train_set, device, batch_size, image_size):
+def dit_forward(model, noisy_images, timesteps, class_labels: Optional[torch.LongTensor] = None):
+    if class_labels is None:
+        raise ValueError(
+            "This diffusers DiT implementation requires class_labels. "
+            "For unconditional training, pass a constant dummy label tensor instead."
+        )
+    return model(noisy_images, timesteps, class_labels=class_labels).sample
+
+
+def run_diffusion_smoke(
+    classifier,
+    train_set,
+    device,
+    batch_size,
+    image_size,
+    unconditional=True,
+    run_balance_step=True,
+):
     dataloader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     images, _ = next(iter(dataloader))
     images = images.to(device)
+    # In diffusers 0.37.1, DiTTransformer2DModel still requires class_labels internally.
+    # To model the unconditional case, we feed a constant dummy label for every sample.
     class_labels = torch.zeros(images.size(0), device=device, dtype=torch.long)
 
     model = DiTTransformer2DModel(
@@ -132,48 +152,53 @@ def run_diffusion_smoke(classifier, train_set, device, batch_size, image_size):
         dtype=torch.long,
     )
     noisy_images = scheduler.add_noise(images, noise, timesteps)
-    predicted_noise = model(noisy_images, timesteps, class_labels=class_labels).sample
+    predicted_noise = dit_forward(model, noisy_images, timesteps, class_labels=class_labels)
 
     loss_diff = F.mse_loss(predicted_noise, noise)
     optimizer.zero_grad()
     loss_diff.backward()
     optimizer.step()
 
-    print(f"pure diffusion smoke loss={loss_diff.item():.4f}")
+    mode_name = "unconditional (dummy-label DiT)" if unconditional else "class-conditioned"
+    print(f"{mode_name} diffusion smoke loss={loss_diff.item():.4f}")
 
-    model.train()
-    noise = torch.randn_like(images)
-    timesteps = torch.randint(
-        0,
-        scheduler.config.num_train_timesteps,
-        (images.size(0),),
-        device=device,
-        dtype=torch.long,
-    )
-    noisy_images = scheduler.add_noise(images, noise, timesteps)
-    predicted_noise = model(noisy_images, timesteps, class_labels=class_labels).sample
-    loss_diff = F.mse_loss(predicted_noise, noise)
+    if run_balance_step:
+        model.train()
+        noise = torch.randn_like(images)
+        timesteps = torch.randint(
+            0,
+            scheduler.config.num_train_timesteps,
+            (images.size(0),),
+            device=device,
+            dtype=torch.long,
+        )
+        noisy_images = scheduler.add_noise(images, noise, timesteps)
+        predicted_noise = dit_forward(model, noisy_images, timesteps, class_labels=class_labels)
+        loss_diff = F.mse_loss(predicted_noise, noise)
 
-    alpha_bar = scheduler.alphas_cumprod[timesteps].to(device).view(-1, 1, 1, 1)
-    x0_hat = (noisy_images - torch.sqrt(1 - alpha_bar) * predicted_noise) / torch.sqrt(alpha_bar)
-    x0_hat = x0_hat.clamp(0, 1)
+        alpha_bar = scheduler.alphas_cumprod[timesteps].to(device).view(-1, 1, 1, 1)
+        x0_hat = (noisy_images - torch.sqrt(1 - alpha_bar) * predicted_noise) / torch.sqrt(alpha_bar)
+        x0_hat = x0_hat.clamp(0, 1)
 
-    classifier.eval()
-    logits = classifier(x0_hat)
-    probs = torch.softmax(logits, dim=1)
-    avg_probs = probs.mean(dim=0)
-    target = torch.full_like(avg_probs, 1.0 / avg_probs.numel())
-    loss_balance = F.mse_loss(avg_probs, target)
-    total_loss = loss_diff + 0.01 * loss_balance
+        if classifier is None:
+            raise RuntimeError("Balance regularization requires a trained classifier.")
 
-    optimizer.zero_grad()
-    total_loss.backward()
-    optimizer.step()
+        classifier.eval()
+        logits = classifier(x0_hat)
+        probs = torch.softmax(logits, dim=1)
+        avg_probs = probs.mean(dim=0)
+        target = torch.full_like(avg_probs, 1.0 / avg_probs.numel())
+        loss_balance = F.mse_loss(avg_probs, target)
+        total_loss = loss_diff + 0.01 * loss_balance
 
-    print(
-        f"balance smoke loss_diff={loss_diff.item():.4f} "
-        f"loss_balance={loss_balance.item():.4f} total={total_loss.item():.4f}"
-    )
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+
+        print(
+            f"balance regularized smoke loss_diff={loss_diff.item():.4f} "
+            f"loss_balance={loss_balance.item():.4f} total={total_loss.item():.4f}"
+        )
 
     model.eval()
     scheduler.set_timesteps(10)
@@ -182,11 +207,8 @@ def run_diffusion_smoke(classifier, train_set, device, batch_size, image_size):
 
     with torch.no_grad():
         for t in scheduler.timesteps:
-            model_output = model(
-                sample,
-                t.unsqueeze(0),
-                class_labels=torch.zeros(1, device=device, dtype=torch.long),
-            ).sample
+            sample_labels = torch.zeros(1, device=device, dtype=torch.long)
+            model_output = dit_forward(model, sample, t.unsqueeze(0), class_labels=sample_labels)
             sample = scheduler.step(model_output, t, sample).prev_sample
 
     generated = sample[0].detach().cpu()
@@ -207,6 +229,17 @@ def main():
     parser.add_argument("--image-size", type=int, default=64)
     parser.add_argument("--classifier-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--mode",
+        choices=["unconditional", "conditional"],
+        default="unconditional",
+        help="Whether DiT should receive class labels during the smoke test.",
+    )
+    parser.add_argument(
+        "--skip-balance-step",
+        action="store_true",
+        help="Skip the classifier-based balance regularization step.",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -236,19 +269,26 @@ def main():
     train_set, val_set = split_dataset(dataset, val_fraction=0.1, seed=42)
     print(f"train_samples={len(train_set)} val_samples={len(val_set)}")
 
-    classifier = train_classifier_smoke(
-        train_set=train_set,
-        val_set=val_set,
-        device=device,
-        epochs=args.classifier_epochs,
-        batch_size=args.batch_size,
-    )
+    classifier = None
+    if args.skip_balance_step:
+        print("Skipping classifier training because --skip-balance-step was set.")
+    else:
+        classifier = train_classifier_smoke(
+            train_set=train_set,
+            val_set=val_set,
+            device=device,
+            epochs=args.classifier_epochs,
+            batch_size=args.batch_size,
+        )
+
     run_diffusion_smoke(
         classifier=classifier,
         train_set=train_set,
         device=device,
         batch_size=args.batch_size,
         image_size=args.image_size,
+        unconditional=args.mode == "unconditional",
+        run_balance_step=not args.skip_balance_step,
     )
 
 

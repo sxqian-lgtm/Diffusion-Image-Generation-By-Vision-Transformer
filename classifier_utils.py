@@ -46,7 +46,12 @@ class JsonLabelDataset(Dataset):
         json_path = image_path.with_suffix(".json")
 
         image = imageio.imread(image_path).astype("float32") / 255.0
-        image = skimage.transform.resize(image, (self.image_size, self.image_size), anti_aliasing=True)
+        image = skimage.transform.resize(
+            image,
+            (self.image_size, self.image_size),
+            anti_aliasing=False,
+            preserve_range=True
+        )
 
         if self.grayscale:
             image = image[..., 0] * 0.299 + image[..., 1] * 0.587 + image[..., 2] * 0.114
@@ -140,8 +145,21 @@ def train_classifier(data_path, device, image_size=64, batch_size=64, num_epochs
     dataset = JsonLabelDataset(data_path, image_size=image_size, grayscale=grayscale)
     train_set, val_set = split_dataset(dataset)
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=3,
+        pin_memory=True
+    )
+
+    val_loader = DataLoader(
+        val_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=3,
+        pin_memory=True
+    )
 
     in_channels = 1 if grayscale else 3
     model = SmallCNNClassifier(in_channels=in_channels, num_classes=len(CLASS_NAMES)).to(device)
@@ -157,9 +175,11 @@ def train_classifier(data_path, device, image_size=64, batch_size=64, num_epochs
         total_correct = 0
         total_count = 0
 
-        for images, labels in train_loader:
-            images = images.to(device)
-            labels = labels.to(device)
+        for batch_idx, (images, labels) in enumerate(train_loader):
+            print(f"\rEpoch {epoch+1} Batch {batch_idx}/{len(train_loader)}", end="", flush=True)
+
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             optimizer.zero_grad()
             logits = model(images)
