@@ -16,3 +16,6 @@ reports/
 
 # Local dataset clone
 synth-cute/
+
+# Local one-off backups created during manual merges
+legacy_root_backup_20260430/

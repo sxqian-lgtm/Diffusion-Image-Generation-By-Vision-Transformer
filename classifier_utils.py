@@ -149,7 +149,7 @@ def train_classifier(data_path, device, image_size=64, batch_size=64, num_epochs
         train_set,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=3,
+        num_workers=6,
         pin_memory=True
     )
 
@@ -157,7 +157,7 @@ def train_classifier(data_path, device, image_size=64, batch_size=64, num_epochs
         val_set,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=3,
+        num_workers=6,
         pin_memory=True
     )
 
